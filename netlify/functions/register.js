@@ -5,7 +5,16 @@ const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL
-const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n')
+
+// Handle all possible ways the private key newlines might be stored
+function getPrivateKey() {
+  const raw = process.env.GOOGLE_PRIVATE_KEY || ''
+  return raw
+    .replace(/\\n/g, '\n')       // literal \n → real newline
+    .replace(/\\\\n/g, '\n')     // double-escaped \\n → real newline
+    .replace(/\r\n/g, '\n')      // Windows line endings
+    .trim()
+}
 
 // ── Supabase insert ──
 async function insertToSupabase(data) {
@@ -32,8 +41,12 @@ async function insertToSupabase(data) {
 }
 
 // ── Google Sheets JWT helper ──
-// Signs a JWT using the Web Crypto API (available in Node 18+)
 async function getGoogleAccessToken() {
+  const GOOGLE_PRIVATE_KEY = getPrivateKey()
+
+  console.log('Private key starts with:', GOOGLE_PRIVATE_KEY.substring(0, 40))
+  console.log('Private key length:', GOOGLE_PRIVATE_KEY.length)
+
   const header = { alg: 'RS256', typ: 'JWT' }
   const now = Math.floor(Date.now() / 1000)
   const claim = {
@@ -47,11 +60,13 @@ async function getGoogleAccessToken() {
   const encode = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url')
   const signingInput = `${encode(header)}.${encode(claim)}`
 
-  // Import the RSA private key
+  // Strip PEM headers and whitespace to get raw base64
   const keyData = GOOGLE_PRIVATE_KEY
-    .replace('-----BEGIN PRIVATE KEY-----', '')
-    .replace('-----END PRIVATE KEY-----', '')
-    .replace(/\s/g, '')
+    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
+    .replace(/-----END PRIVATE KEY-----/g, '')
+    .replace(/\s+/g, '')
+
+  console.log('Key data length after stripping:', keyData.length)
 
   const binaryKey = Buffer.from(keyData, 'base64')
   const cryptoKey = await crypto.subtle.importKey(
@@ -70,7 +85,6 @@ async function getGoogleAccessToken() {
 
   const jwt = `${signingInput}.${Buffer.from(signature).toString('base64url')}`
 
-  // Exchange JWT for access token
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -81,6 +95,9 @@ async function getGoogleAccessToken() {
   })
 
   const tokenData = await tokenRes.json()
+  console.log('Google token response status:', tokenRes.status)
+  console.log('Google token response:', JSON.stringify(tokenData))
+
   if (!tokenData.access_token) throw new Error('Google auth failed: ' + JSON.stringify(tokenData))
   return tokenData.access_token
 }
@@ -92,17 +109,17 @@ async function appendToSheet(data) {
   const timestamp = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' })
   const row = [timestamp, data.name, data.email, data.instagram, data.whatsapp]
 
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/A:E/append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ values: [row] })
-    }
-  )
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/A:E/append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
+  console.log('Sheets URL:', url)
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ values: [row] })
+  })
 
   if (!res.ok) {
     const err = await res.text()
@@ -134,7 +151,6 @@ export const handler = async (event) => {
   }
 
   try {
-    // Run both in parallel for speed
     await Promise.all([
       insertToSupabase(data),
       appendToSheet(data)
